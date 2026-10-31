@@ -1,8 +1,13 @@
-name: "Rebuild Armbian"
-author: "https://github.com/armbian"
-description: "Build Armbian Linux"
+name: "重新编译 Armbian"
+author: "https://github.com/rmoyulong/armbian"
+description: "编译 Armbian Linux"
 inputs:
 
+  ONECLOUD_VERSION: 
+    description: "玩客云 armbian Linux 版本"
+    required: true
+    default: "6.12.115"
+    
   armbian_token:
     description: "GitHub installation access token"
     required: true
@@ -80,7 +85,7 @@ inputs:
   armbian_release_body:
     description: "Armbian images"
     required: false
-    default: "Build with [Armbian tools](https://github.com/armbian/build)"
+    default: "编译使用 [Armbian 工具](https://github.com/rmoyulong/armbian)"
 
   armbian_release_tag:
     description: "Armbian release tag"
@@ -141,7 +146,7 @@ runs:
     - name: "Checkout Armbian build framework"
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        repository: armbian/build
+        repository: rmoyulong/armbian
         ref: ${{ inputs.armbian_branch }}
         clean: false
         path: build
@@ -153,6 +158,18 @@ runs:
         clean: false
         path: custom
 
+    - name: "给玩客云armbian打补丁-version[${{ inputs.ONECLOUD_VERSION }}]"
+      shell: bash
+      run: |
+        sed -i 's/declare -g KERNELBRANCH="tag:v6.12.28" # frozen on this version/declare -g KERNELBRANCH="tag:v${{ inputs.ONECLOUD_VERSION }}"/' \
+          build/config/sources/families/include/meson_common.inc
+        rm build/patch/kernel/archive/meson-6.12/0052-drm-meson-Describe-the-HDMI-PHY-frequency-limits-of-.patch
+        curl -fsSL -o build/patch/kernel/archive/meson-6.12/0052-drm-meson-Describe-the-HDMI-PHY-frequency-limits-of-.patch \
+          https://github.com/rmoyulong/Template/raw/refs/heads/master/patch/0052-drm-meson-Describe-the-HDMI-PHY-frequency-limits-of-.patch
+        grep -n 'KERNEL_MAJOR_MINOR\|KERNELBRANCH' build/config/sources/families/include/meson_common.inc || true  
+        ls build/patch/kernel/archive/meson-6.12/0052-*
+        ls
+        
     - shell: bash
       env:
         GH_TOKEN: ${{ inputs.armbian_token }}
@@ -560,9 +577,131 @@ runs:
         print(f"Total: {len(assets)} per-image assets manifest{'s' if len(assets) != 1 else ''}")
         PY
 
-    - uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+    - name: "安装AmlImg"
+      shell: bash
+      run: |    
+        sudo apt install android-sdk-libsparse-utils
+        
+        cd build        
+        ver="v0.3.2"
+        curl -L -o ./AmlImg https://github.com/rmoyulong/AmlImg/releases/download/$ver/AmlImg_${ver}_linux_amd64
+        chmod +x ./AmlImg   
+
+    - name: "下载解压最新u-boot"
+      shell: bash
+      run: |
+        cd build
+        mkdir -p burn
+        
+        #ls output/images/*
+        echo "::group::Download"
+        curl -L -o ./uboot.img https://github.com/rmoyulong/u-boot-onecloud/releases/download/Onecloud_Uboot_23.12.24_18.15.09/eMMC.burn.img
+        echo "::endgroup::"
+
+        echo "::group::Unpack"
+        ./AmlImg unpack ./uboot.img burn/
+        echo "::endgroup::"
+
+    - name: "提取引导分区和根文件系统分区并生成线刷固件"
+      shell: bash
+      run: |
+        set -euo pipefail   # 比 -e 更严格：未定义变量报错、管道任一环失败报错
+
+        cd build
+        # 明确只取一个 xz 文件，多于一个直接报错
+        diskxz=(output/images/*.img.xz)
+        if [[ ${#diskxz[@]} -ne 1 ]]; then
+          echo "错误：期望恰好 1 个 .img.xz 文件，实际找到 ${#diskxz[@]} 个：" >&2
+          printf '  %s\n' "${diskxz[@]}" >&2
+          exit 1
+        fi
+
+        echo "解压编译完成的镜像：${diskxz[0]}"
+        sudo xz -dkf "${diskxz[0]}"   # -k 保留原 xz，-f 覆盖已存在的 img 或者一行即可xz -dc "${diskxz[0]}" > "${diskxz[0]%.xz}"
+        sudo chown "$(id -u):$(id -g)" "${diskxz[0]%.xz}"
+
+        # 同样断言只有一个 img
+        diskimgs=(output/images/*.img)
+        if [[ ${#diskimgs[@]} -ne 1 ]]; then
+          echo "错误：期望恰好 1 个 .img 文件，实际找到 ${#diskimgs[@]} 个：" >&2
+          printf '  %s\n' "${diskimgs[@]}" >&2
+          exit 1
+        fi
+        diskimg="${diskimgs[0]}"
+
+        echo "build 目录列表："
+        ls -la
+        echo "output/images/ 目录列表："
+        ls -la output/images/
+        sync
+
+        # ---- 挂载 loop 并确保清理 ----
+        loop=""
+        cleanup() {
+          local rc=$?
+          if [[ -n "$loop" ]]; then
+            sudo losetup -d "$loop" || true
+          fi
+          exit $rc
+        }
+        trap cleanup EXIT INT TERM
+
+        loop=$(sudo losetup --find --show --partscan "$diskimg")
+        echo "loop 设备：$loop"
+
+        # 等待分区节点出现（最多 5 秒）
+        for i in {1..50}; do
+          [[ -b "${loop}p1" && -b "${loop}p2" ]] && break
+          sleep 0.1
+        done
+        if [[ ! -b "${loop}p1" || ! -b "${loop}p2" ]]; then
+          echo "错误：分区设备 ${loop}p1 / ${loop}p2 未就绪" >&2
+          ls -l "${loop}"* || true
+          exit 1
+        fi
+
+        sudo img2simg "${loop}p1" burn/boot.simg
+        sudo img2simg "${loop}p2" burn/rootfs.simg
+
+        # trap 会自动卸载，这里也可以显式卸载让后续权限修复更安全
+        sudo losetup -d "$loop"
+        loop=""
+
+        sudo chown -R "$(id -u):$(id -g)" burn/
+
+        echo "burn/ 目录内容："
+        ls -lh burn/
+        
+        echo -n "sha1sum $(sha1sum burn/boot.simg | awk '{print $1}')" >burn/boot.VERIFY
+        echo -n "sha1sum $(sha1sum burn/rootfs.simg | awk '{print $1}')" >burn/rootfs.VERIFY
+
+        cat <<EOF >>burn/commands.txt
+        PARTITION:boot:sparse:boot.simg
+        VERIFY:boot:normal:boot.VERIFY
+        PARTITION:rootfs:sparse:rootfs.simg
+        VERIFY:rootfs:normal:rootfs.VERIFY
+        EOF
+
+        prefix=$(ls $diskimg | sed 's/\.img$//')
+        burnimg=${prefix}.burn.img
+        ./AmlImg pack $burnimg burn/
+
+        #删除解压的img
+        rm $diskimg
+
+    - name: "镜像哈希信息和压缩"
+      shell: bash
+      run: |
+        cd build
+        for f in output/images/*.img; do
+          sha256sum "$f" | tee -a sha256sum
+          xz --threads=0 --compress "$f"
+        done
+
+    - name: "上传编译完成的线刷和卡刷镜像"
+      uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
       with:
-        tag: ${{ inputs.armbian_release_tag != '' && inputs.armbian_release_tag || env.ARMBIAN_VERSION }}
+        tag: "${{ inputs.armbian_release_title }}"
         name: "${{ inputs.armbian_release_title }}"
         artifacts: "${{ inputs.armbian_artifacts }}*"
         allowUpdates: true
@@ -578,4 +717,3 @@ runs:
 branding:
   icon: "check"
   color: "red"
-
